@@ -9,3 +9,9 @@ node_modules/
 .next/
 dist/
 build/
+
+# Scraper artifacts
+backend/cache.db
+backend/*.db-journal
+*.sqlite
+*.sqlite-journal

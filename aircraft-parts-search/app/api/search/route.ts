@@ -1,113 +1,134 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { expandSearchTerms } from '@/lib/services/nsn';
-import { searchPartsbase } from '@/lib/services/partsbase';
-import { scrapeStockMarket } from '@/lib/services/stockmarket';
-import { searchEbay } from '@/lib/services/ebay';
-import { searchLocatory } from '@/lib/services/locatory';
-import { scrapeMcMaster } from '@/lib/services/mcmaster';
-import { searchInventory } from '@/lib/services/googleSheets';
 import { SearchResult } from '@/lib/types';
 
 /**
  * POST /api/search
- * 
- * Searches multiple data sources for aircraft parts.
- * 
- * Request body: { 
- *   query: string,
- *   sources?: { partsbase?: boolean, stockmarket?: boolean, ebay?: boolean, locatory?: boolean, mcmaster?: boolean, inventory?: boolean }
- * }
- * Response: { results: { [source: string]: SearchResult[] } }
+ *
+ * Thin proxy to the FastAPI scraper backend. The backend actually hits
+ * stockmarket.aero and nsn-now.com in real time; this route shapes the
+ * response to match what the UI expects.
+ *
+ * Request:  { query: string, sources?: { stockmarket?: boolean, nsn?: boolean } }
+ * Response: { query, searchTerms, results: Record<string, SearchResult[]>, totalResults }
  */
+
+const BACKEND_URL = process.env.AEROSCRAPER_BACKEND_URL ?? 'http://127.0.0.1:8787';
+
+type StockmarketRecord = {
+  source: string;
+  vendor: string;
+  part_number: string;
+  description: string;
+  qty: string;
+  condition: string;
+  price: string;
+  location: string;
+  link: string;
+};
+
+type NsnRecord = {
+  source: string;
+  nsn: string;
+  description: string;
+  is_primary: boolean;
+  link: string;
+};
+
+type BackendResponse = {
+  query: string;
+  elapsed_ms: number;
+  results: Record<
+    string,
+    {
+      source?: string;
+      query?: string;
+      _from_cache?: boolean;
+      primary_nsn?: string;
+      primary_description?: string;
+      related_nsns?: string[];
+      results: StockmarketRecord[] | NsnRecord[];
+      error?: string;
+    }
+  >;
+};
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { query, sources } = body;
-    
-    if (!query || typeof query !== 'string') {
-      return NextResponse.json(
-        { error: 'Query is required and must be a string' },
-        { status: 400 }
-      );
+    const query: string = (body?.query ?? '').trim();
+    if (!query) {
+      return NextResponse.json({ error: 'Query is required' }, { status: 400 });
     }
-    
-    const trimmedQuery = query.trim();
-    
-    if (trimmedQuery.length === 0) {
-      return NextResponse.json(
-        { error: 'Query cannot be empty' },
-        { status: 400 }
-      );
-    }
-    
-    // Default all sources to enabled if not specified
-    const enabledSources = {
-      partsbase: sources?.partsbase !== false,
-      stockmarket: sources?.stockmarket !== false,
-      ebay: sources?.ebay !== false,
-      locatory: sources?.locatory !== false,
-      mcmaster: sources?.mcmaster !== false,
-      inventory: sources?.inventory !== false,
-    };
-    
-    // Expand search terms using NSN lookup
-    const searchTerms = await expandSearchTerms(trimmedQuery);
-    
-    // Build search promises based on enabled sources
-    const searchPromises: Promise<SearchResult[]>[] = [];
-    
-    searchTerms.forEach((term) => {
-      if (enabledSources.partsbase) searchPromises.push(searchPartsbase(term));
-      if (enabledSources.stockmarket) searchPromises.push(scrapeStockMarket(term));
-      if (enabledSources.ebay) searchPromises.push(searchEbay(term));
-      if (enabledSources.locatory) searchPromises.push(searchLocatory(term));
-      if (enabledSources.mcmaster) searchPromises.push(scrapeMcMaster(term));
-      if (enabledSources.inventory) searchPromises.push(searchInventory(term));
+
+    const sourceFlags = body?.sources ?? {};
+    const sources: string[] = [];
+    if (sourceFlags.stockmarket !== false) sources.push('stockmarket');
+    if (sourceFlags.nsn !== false) sources.push('nsn');
+
+    const backendRes = await fetch(`${BACKEND_URL}/search`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query, sources }),
+      cache: 'no-store',
     });
-    
-    const searchResults = await Promise.all(searchPromises);
-    
-    // Flatten all results into one array
-    const allResults: SearchResult[] = searchResults.flat();
-    
-    // Group results by source
-    const groupedResults: Record<string, SearchResult[]> = {};
-    
-    for (const result of allResults) {
-      const source = result.source || 'Unknown';
-      
-      if (!groupedResults[source]) {
-        groupedResults[source] = [];
-      }
-      
-      groupedResults[source].push(result);
+
+    if (!backendRes.ok) {
+      return NextResponse.json(
+        { error: `Backend returned ${backendRes.status}` },
+        { status: 502 },
+      );
     }
-    
-    // Remove duplicates within each source group (based on partNumber + link)
-    for (const source of Object.keys(groupedResults)) {
-      const seen = new Set<string>();
-      groupedResults[source] = groupedResults[source].filter((result) => {
-        const key = `${result.partNumber}|${result.link}`;
-        if (seen.has(key)) {
-          return false;
-        }
-        seen.add(key);
-        return true;
-      });
+
+    const backend: BackendResponse = await backendRes.json();
+
+    const results: Record<string, SearchResult[]> = {};
+    const searchTerms = new Set<string>([query]);
+
+    const stockmarket = backend.results.stockmarket;
+    if (stockmarket && !stockmarket.error) {
+      const records = (stockmarket.results as StockmarketRecord[]) ?? [];
+      results['StockMarket.aero'] = records.map((r) => ({
+        partNumber: r.part_number,
+        source: r.vendor || 'StockMarket.aero',
+        qty: r.qty || 'N/A',
+        condition: r.condition || 'N/A',
+        price: r.price || 'RFQ',
+        link: r.link,
+        vendor: r.vendor,
+        description: r.description,
+        location: r.location,
+      }));
     }
-    
+
+    const nsn = backend.results.nsn;
+    if (nsn && !nsn.error) {
+      const records = (nsn.results as NsnRecord[]) ?? [];
+      (nsn.related_nsns ?? []).forEach((n) => searchTerms.add(n));
+      results['NSN-NOW'] = records.map((r) => ({
+        partNumber: r.nsn,
+        source: r.is_primary ? 'NSN-NOW (primary)' : 'NSN-NOW (related)',
+        qty: 'N/A',
+        condition: '—',
+        price: 'Subscribe for price',
+        link: r.link,
+        nsn: r.nsn,
+        description: r.description || (r.is_primary ? nsn.primary_description ?? '' : ''),
+        isPrimary: r.is_primary,
+      }));
+    }
+
+    const totalResults = Object.values(results).reduce((acc, arr) => acc + arr.length, 0);
+
     return NextResponse.json({
-      query: trimmedQuery,
-      searchTerms,
-      results: groupedResults,
-      totalResults: allResults.length,
+      query,
+      searchTerms: Array.from(searchTerms),
+      results,
+      totalResults,
+      elapsedMs: backend.elapsed_ms,
     });
-    
-  } catch (error) {
-    console.error('Search API error:', error);
-    return NextResponse.json(
-      { error: 'An error occurred while searching' },
-      { status: 500 }
-    );
+  } catch (err) {
+    console.error('search proxy error', err);
+    const message = err instanceof Error ? err.message : 'unknown error';
+    return NextResponse.json({ error: message }, { status: 500 });
   }
 }
